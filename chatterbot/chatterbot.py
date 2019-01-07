@@ -1,155 +1,257 @@
-from .utils.module_loading import import_module
-from .conversation import Statement, Response
+import logging
+from chatterbot.storage import StorageAdapter
+from chatterbot.logic import LogicAdapter
+from chatterbot.input import InputAdapter
+from chatterbot.output import OutputAdapter
+from chatterbot.search import IndexedTextSearch
+from chatterbot.conversation import Statement
+from chatterbot import utils
 
 
 class ChatBot(object):
+    """
+    A conversational dialog chat bot.
+    """
 
     def __init__(self, name, **kwargs):
         self.name = name
 
-        storage_adapter = kwargs.get("storage_adapter",
-            "chatterbot.adapters.storage.JsonDatabaseAdapter"
+        primary_search_algorithm = IndexedTextSearch(self, **kwargs)
+
+        self.search_algorithms = {
+            primary_search_algorithm.name: primary_search_algorithm
+        }
+
+        storage_adapter = kwargs.get('storage_adapter', 'chatterbot.storage.SQLStorageAdapter')
+
+        logic_adapters = kwargs.get('logic_adapters', [
+            'chatterbot.logic.BestMatch'
+        ])
+
+        input_adapter = kwargs.get('input_adapter', 'chatterbot.input.InputAdapter')
+
+        output_adapter = kwargs.get('output_adapter', 'chatterbot.output.OutputAdapter')
+
+        # Check that each adapter is a valid subclass of it's respective parent
+        utils.validate_adapter_class(storage_adapter, StorageAdapter)
+        utils.validate_adapter_class(input_adapter, InputAdapter)
+        utils.validate_adapter_class(output_adapter, OutputAdapter)
+
+        # Logic adapters used by the chat bot
+        self.logic_adapters = []
+
+        self.storage = utils.initialize_class(storage_adapter, **kwargs)
+        self.input = utils.initialize_class(input_adapter, self, **kwargs)
+        self.output = utils.initialize_class(output_adapter, self, **kwargs)
+
+        for adapter in logic_adapters:
+            utils.validate_adapter_class(adapter, LogicAdapter)
+            logic_adapter = utils.initialize_class(adapter, self, **kwargs)
+            self.logic_adapters.append(logic_adapter)
+
+        preprocessors = kwargs.get(
+            'preprocessors', [
+                'chatterbot.preprocessors.clean_whitespace'
+            ]
         )
 
-        logic_adapter = kwargs.get("logic_adapter",
-            "chatterbot.adapters.logic.ClosestMatchAdapter"
+        self.preprocessors = []
+
+        for preprocessor in preprocessors:
+            self.preprocessors.append(utils.import_module(preprocessor))
+
+        self.logger = kwargs.get('logger', logging.getLogger(__name__))
+
+        # Allow the bot to save input it receives so that it can learn
+        self.read_only = kwargs.get('read_only', False)
+
+        if kwargs.get('initialize', True):
+            self.initialize()
+
+    def get_initialization_functions(self):
+        initialization_functions = utils.get_initialization_functions(
+            self, 'storage.tagger'
         )
 
-        io_adapter = kwargs.get("io_adapter",
-            "chatterbot.adapters.io.TerminalAdapter"
-        )
+        for search_algorithm in self.search_algorithms.values():
+            search_algorithm_functions = utils.get_initialization_functions(
+                search_algorithm, 'compare_statements'
+            )
+            initialization_functions.update(search_algorithm_functions)
 
-        StorageAdapter = import_module(storage_adapter)
-        self.storage = StorageAdapter(**kwargs)
+        return initialization_functions
 
-        LogicAdapter = import_module(logic_adapter)
-        self.logic = LogicAdapter(**kwargs)
-
-        IOAdapter = import_module(io_adapter)
-        self.io = IOAdapter(**kwargs)
-
-        self.trainer = None
-
-        self.recent_statements = []
-
-    def get_last_statement(self):
+    def initialize(self):
         """
-        Return the last statement that was received.
+        Do any work that needs to be done before the chatbot can process responses.
         """
-        if self.recent_statements:
-            return self.recent_statements[-1]
-        return None
+        for function in self.get_initialization_functions().values():
+            function()
 
-    def get_most_frequent_response(self, input_statement, response_list):
-        """
-        Returns the statement with the greatest number of occurrences.
-        """
-
-        # Initialize the matching responce to the first response.
-        # This will be returned in the case that no match can be found.
-        matching_response = response_list[0]
-        occurrence_count = 0
-
-        for statement in response_list:
-            count = statement.get_response_count(input_statement)
-
-            # Keep the more common statement
-            if count >= occurrence_count:
-                matching_response = statement
-                occurrence_count = count
-
-        # Choose the most commonly occuring matching response
-        return matching_response
-
-    def get_first_response(self, response_list):
-        """
-        Return the first statement in the response list.
-        """
-        return response_list[0]
-
-    def get_random_response(self, response_list):
-        """
-        Choose a random response from the selection.
-        """
-        from random import choice
-        return choice(response_list)
-
-    def get_response(self, input_text):
+    def get_response(self, statement=None, **kwargs):
         """
         Return the bot's response based on the input.
+
+        :param statement: An statement object or string.
+        :returns: A response to the input.
+        :rtype: Statement
         """
-        input_statement = Statement(input_text)
+        if isinstance(statement, str):
+            kwargs['text'] = statement
 
-        # If no responses exist, return the input statement
-        if not self.storage.count():
-            self.storage.update(input_statement)
-            self.recent_statements.append(input_statement)
+        if statement is None and 'text' not in kwargs:
+            raise self.ChatBotException(
+                'Either a statement object or a "text" keyword '
+                'argument is required. Neither was provided.'
+            )
 
-            # Process the response output with the IO adapter
-            return self.io.process_response(input_statement)
+        if hasattr(statement, 'text'):
+            data = statement.serialize()
+            data.update(kwargs)
+            kwargs = data
 
-        all_statements = self.storage.filter()
+        if isinstance(statement, dict):
+            statement.update(kwargs)
+            kwargs = statement
 
-        # Select the closest match to the input statement
-        closest_match = self.logic.get(
-            input_statement,
-            all_statements,
-            self.recent_statements
+        input_statement = self.input.process_input(kwargs)
+
+        # Preprocess the input statement
+        for preprocessor in self.preprocessors:
+            input_statement = preprocessor(input_statement)
+
+        response = self.generate_response(input_statement)
+
+        # Learn that the user's input was a valid response to the chat bot's previous output
+        previous_statement = self.get_latest_response(input_statement.conversation)
+
+        if not self.read_only:
+            self.learn_response(input_statement, previous_statement)
+
+            # Save the response generated for the input
+            self.storage.create(
+                text=response.text,
+                in_response_to=response.in_response_to,
+                conversation=response.conversation,
+                persona=response.persona
+            )
+
+        # Process the response output with the output adapter
+        return self.output.process_response(response)
+
+    def generate_response(self, input_statement):
+        """
+        Return a response based on a given input statement.
+
+        :param input_statement: The input statement to be processed.
+        """
+        from collections import Counter
+
+        results = []
+        result = None
+        max_confidence = -1
+
+        for adapter in self.logic_adapters:
+            if adapter.can_process(input_statement):
+
+                output = adapter.process(input_statement)
+                results.append((output.confidence, output, ))
+
+                self.logger.info(
+                    '{} selected "{}" as a response with a confidence of {}'.format(
+                        adapter.class_name, output.text, output.confidence
+                    )
+                )
+
+                if output.confidence > max_confidence:
+                    result = output
+                    max_confidence = output.confidence
+            else:
+                self.logger.info(
+                    'Not processing the statement using {}'.format(adapter.class_name)
+                )
+
+        # If multiple adapters agree on the same statement,
+        # then that statement is more likely to be the correct response
+        if len(results) >= 3:
+            statements = tuple(
+                s[1] for s in results
+            )
+            count = Counter(statements)
+            most_common = count.most_common()
+            if most_common[0][1] > 1:
+                result = most_common[0][0]
+                max_confidence = utils.get_greatest_confidence(result, results)
+
+        response = Statement(
+            text=result.text,
+            in_response_to=input_statement.text,
+            conversation=input_statement.conversation,
+            persona='bot:' + self.name
         )
 
-        # Get all statements that are in response to the closest match
-        response_list = self.storage.filter(
-            in_response_to__contains=closest_match.text
-        )
-
-        if response_list:
-            #response = self.get_most_frequent_response(closest_match, response_list)
-            response = self.get_first_response(response_list)
-            #response = self.get_random_response(response_list)
-        else:
-            response = self.storage.get_random()
-
-        #if input_statement.text == closest_match.text:
-        #    input_statement = closest_match
-
-        # TODO: Why is checking if the input is equal to the closest match not the same here?
-        existing_statement = self.storage.find(input_statement.text)
-
-        if existing_statement:
-            input_statement = existing_statement
-
-        previous_statement = self.get_last_statement()
-
-        if previous_statement:
-            input_statement.add_response(previous_statement)
-
-        # Update the database after selecting a response
-        self.storage.update(input_statement)
-
-        self.recent_statements.append(response)
-
-        # Process the response output with the IO adapter
-        response = self.io.process_response(response)
+        response.confidence = max_confidence
 
         return response
 
-    def get_input(self):
-        return self.io.process_input()
-
-    def train(self, conversation=None, *args, **kwargs):
+    def learn_response(self, statement, previous_statement):
         """
-        Train the chatbot based on input data.
+        Learn that the statement provided is a valid response.
         """
-        from .training import Trainer
+        previous_statement_text = previous_statement
 
-        self.trainer = Trainer(self)
+        if previous_statement is not None:
+            previous_statement_text = previous_statement.text
 
-        if isinstance(conversation, str):
-            corpora = list(args)
-            corpora.append(conversation)
+        self.logger.info('Adding "{}" as a response to "{}"'.format(
+            statement.text,
+            previous_statement_text
+        ))
 
-            if corpora:
-                self.trainer.train_from_corpora(corpora)
-        else:
-            self.trainer.train_from_list(conversation)
+        # Save the input statement
+        return self.storage.create(
+            text=statement.text,
+            in_response_to=previous_statement_text,
+            conversation=statement.conversation,
+            tags=statement.tags
+        )
 
+    def get_latest_response(self, conversation):
+        """
+        Returns the latest response in a conversation if it exists.
+        Returns None if a matching conversation cannot be found.
+        """
+        from chatterbot.conversation import Statement as StatementObject
+
+        conversation_statements = list(self.storage.filter(
+            conversation=conversation,
+            order_by=['id']
+        ))
+
+        # Get the most recent statement in the conversation if one exists
+        latest_statement = conversation_statements[-1] if conversation_statements else None
+
+        if latest_statement:
+            if latest_statement.in_response_to:
+
+                response_statements = list(self.storage.filter(
+                    conversation=conversation,
+                    text=latest_statement.in_response_to,
+                    order_by=['id']
+                ))
+
+                if response_statements:
+                    return response_statements[-1]
+                else:
+                    return StatementObject(
+                        text=latest_statement.in_response_to,
+                        conversation=conversation
+                    )
+            else:
+                # The case that the latest statement is not in response to another statement
+                return latest_statement
+
+        return None
+
+    class ChatBotException(Exception):
+        pass

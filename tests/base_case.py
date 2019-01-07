@@ -1,73 +1,63 @@
-from unittest import TestCase
+from unittest import TestCase, SkipTest
 from chatterbot import ChatBot
-import os
 
 
-class UntrainedChatBotTestCase(TestCase):
+class ChatBotTestCase(TestCase):
 
     def setUp(self):
-        self.test_data_directory = 'test_data'
-        self.test_database_name = self.random_string() + ".db"
-
-        if not os.path.exists(self.test_data_directory):
-            os.makedirs(self.test_data_directory)
-
-        database_path = self.test_data_directory + '/' + self.test_database_name
-
-        self.chatbot = ChatBot(
-            "Test Bot",
-            io_adapter="chatterbot.adapters.io.NoOutputAdapter",
-            database=database_path
-        )
-
-    def random_string(self, start=0, end=9000):
-        """
-        Generate a string based on a random number.
-        """
-        from random import randint
-        return str(randint(start, end))
-
-    def remove_test_data(self):
-        import shutil
-
-        if os.path.exists(self.test_data_directory):
-            shutil.rmtree(self.test_data_directory)
+        self.chatbot = ChatBot('Test Bot', **self.get_kwargs())
 
     def tearDown(self):
         """
         Remove the test database.
         """
         self.chatbot.storage.drop()
-        self.remove_test_data()
 
-
-class ChatBotTestCase(UntrainedChatBotTestCase):
-
-    def setUp(self):
-        super(ChatBotTestCase, self).setUp()
+    def assertIsLength(self, item, length):
         """
-        Set up a database for testing.
+        Assert that an iterable has the given length.
         """
-        data1 = [
-            "african or european?",
-            "Huh? I... I don't know that.",
-            "How do you know so much about swallows?"
-        ]
+        if len(item) != length:
+            raise AssertionError(
+                'Length {} is not equal to {}'.format(len(item), length)
+            )
 
-        data2 = [
-            "Siri is adorable",
-            "Who is Seri?",
-            "Siri is my cat"
-        ]
+    def get_kwargs(self):
+        return {
+            # Run the test database in-memory
+            'database_uri': None,
+            # Don't execute initialization processes such as downloading required data
+            'initialize': False
+        }
 
-        data3 = [
-            "What... is your quest?",
-            "To seek the Holy Grail.",
-            "What... is your favourite colour?",
-            "Blue."
-        ]
 
-        self.chatbot.train(data1)
-        self.chatbot.train(data2)
-        self.chatbot.train(data3)
+class ChatBotMongoTestCase(ChatBotTestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        from pymongo.errors import ServerSelectionTimeoutError
+        from pymongo import MongoClient
+
+        # Skip these tests if a mongo client is not running
+        try:
+            client = MongoClient(
+                serverSelectionTimeoutMS=0.1
+            )
+            client.server_info()
+
+        except ServerSelectionTimeoutError:
+            raise SkipTest('Unable to connect to Mongo DB.')
+
+    def get_kwargs(self):
+        kwargs = super(ChatBotMongoTestCase, self).get_kwargs()
+        kwargs['database_uri'] = 'mongodb://localhost:27017/chatterbot_test_database'
+        kwargs['storage_adapter'] = 'chatterbot.storage.MongoDatabaseAdapter'
+        return kwargs
+
+
+class ChatBotSQLTestCase(ChatBotTestCase):
+
+    def get_kwargs(self):
+        kwargs = super(ChatBotSQLTestCase, self).get_kwargs()
+        kwargs['storage_adapter'] = 'chatterbot.storage.SQLStorageAdapter'
+        return kwargs
